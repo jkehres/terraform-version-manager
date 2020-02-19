@@ -18,6 +18,11 @@ const INSTALL_DIR = path.join(os.homedir(), '.tfvm');
 const VERSIONS_DIR = path.join(INSTALL_DIR, 'versions');
 const CURRENT_LINK = path.join(INSTALL_DIR, `terraform${EXE_SUFFIX}`);
 
+// TODO: fsPromise alternative
+// TODO: README
+// TODO: linter
+// TODO: tests
+
 function getArch() {
     const arch = os.arch();
     switch (arch) {
@@ -81,7 +86,7 @@ async function isInstalled(version) {
     }
 }
 
-async function downloadSum(version) {
+async function fetchSum(version) {
     const [sumsRes, sigRes] = await Promise.all([
         request.get(getSumsUrl(version)),
         request.get(getSigUrl(version)).buffer(true)
@@ -109,14 +114,10 @@ async function downloadSum(version) {
 }
 
 async function install(version) {
-    if (await isInstalled(version)) {
-        return;
-    }
-
     await fsPromises.mkdir(VERSIONS_DIR, {recursive: true});
 
     const outputPath = getPath(version);
-    const calculatedSum = await new Promise((resolve, reject) => {
+    const actualSum = await new Promise((resolve, reject) => {
         const req = request.get(getExeUrl(version));
         const unzipStream = unzipper.ParseOne();
         const hashStream = new sha256Stream();
@@ -140,33 +141,28 @@ async function install(version) {
         req.pipe(hashStream).pipe(unzipStream);
     });
 
-    const donwloadedSum = await downloadSum(version);
-    if (calculatedSum !== donwloadedSum) {
-        await fsPromises.unlink(outputPath);
-        throw new Error('Hash verification failed');
-    }
+    try {
+        const expectedSum = await fetchSum(version);
+        if (actualSum !== expectedSum) {
+            throw new Error('Hash verification failed');
+        }
 
-    await fsPromises.chmod(outputPath, '755');
+        await fsPromises.chmod(outputPath, '755');
+    } catch (err) {
+        await fsPromises.unlink(outputPath);
+        throw err;
+    }
 }
 
 async function uninstall(version) {
-    const current = await getCurrent();
-    if (!current || !await isInstalled(version)) {
-        throw new Error(`Version ${version} is not installed`);
-    }
-
-    if (version === await getCurrent()) {
-        throw new Error('Cannot uninstall current version')
+    if (await getCurrent() === version) {
+        await setCurrent(null);
     }
 
     await fsPromises.unlink(getPath(version));
 }
 
 async function setCurrent(version) {
-    if (!await isInstalled(version)) {
-        throw new Error(`Version ${version} is not installed`);
-    }
-
     try {
         await fsPromises.unlink(CURRENT_LINK);
     } catch (err) {
@@ -176,10 +172,12 @@ async function setCurrent(version) {
     }
     
     try {
-        await fsPromises.symlink(getPath(version), CURRENT_LINK);
+        if (version !== null) {
+            await fsPromises.symlink(getPath(version), CURRENT_LINK);
+        }
     } catch (err) {
         if (err.code === 'EPERM') {
-            throw new Error('Command requires administrator priveleges');
+            throw new Error('Insufficient permissions to set new version - retry as an administrator');
         }
     }
 }
@@ -210,62 +208,88 @@ async function list() {
     }
 }
 
+async function listCommand() {
+    const [current, versions] = await Promise.all([getCurrent(), list()]);
+    if (versions.length === 0) {
+        console.log('No versions installed');
+    } else {
+        versions.forEach(version => {
+            if (version === current) {
+                console.log(`  * ${version}`);
+            } else {
+                console.log(`    ${version}`);
+            }
+        });
+    }
+}
+
+async function useCommand(argv) {
+    if (!await isInstalled(argv.version)) {
+        throw new Error(`Version ${argv.version} is not installed`);
+    }
+
+    await setCurrent(argv.version);
+    console.log(`Now using version ${argv.version}`);
+}
+
+async function installCommand(argv) {
+    if (await isInstalled(argv.version)) {
+        console.log(`Version ${argv.version} already installed`);
+    } else {
+        console.log(`Downloading version ${argv.version}...`);
+        await install(argv.version);
+        console.log(`Complete`);
+        if (await getCurrent() === null) {
+            await useCommand();
+        }
+    }
+}
+
+async function uninstallCommand(argv) {
+    if (!await isInstalled(argv.version)) {
+        throw new Error(`Version ${argv.version} is not installed`);
+    }
+
+    console.log(`Uninstalling version ${argv.version}...`);
+    await uninstall(argv.version);
+    console.log(`Complete`);
+
+    if (await getCurrent() === null) {
+        console.log('WARNING: No version is set')
+    }
+}
+
+function commandRunner(commandFunc) {
+    return async (argv) => {
+        try {
+            await commandFunc(argv);
+        } catch (err) {
+            console.error(`ERROR: ${err.message}`);
+            process.exitCode = 1;
+        }
+    };
+}
+
 require('yargs')
     .command({
         command: 'list', 
-        describe: 'show installed versions of terraform',
-        handler: async () => {
-            try {
-                const [current, versions] = await Promise.all([getCurrent(), list()]);
-                versions.forEach(version => {
-                    if (version === current) {
-                        console.log(`  * ${version}`);
-                    } else {
-                        console.log(`    ${version}`);
-                    }
-                });
-            } catch (err) {
-                console.error(err);
-            }
-        }
-    })
-    .command({
-        command: 'install <version>', 
-        describe: 'install the specified version of terraform',
-        handler: async (argv) => {
-            try {
-                console.log(`Downloading terraform version ${argv.version}...`);
-                await install(argv.version);
-                console.log(`Complete`);
-            } catch (err) {
-                console.error(err.message);
-            }
-        }
-    })
-    .command({
-        command: 'uninstall <version>', 
-        describe: 'uninstall the specified version of terraform',
-        handler: async (argv) => {
-            try {
-                console.log(`Uninstalling terraform version ${argv.version}...`);
-                await uninstall(argv.version);
-                console.log(`Complete`);
-            } catch (err) {
-                console.error(err.message);
-            }
-        }
+        describe: 'Show installed versions of Terraform',
+        handler: commandRunner(listCommand)
     })
     .command({
         command: 'use <version>', 
-        describe: 'switch to the specified version of terraform',
-        handler: async (argv) => {
-            try {
-                await setCurrent(argv.version);
-                console.log(`Now usng terraform version ${argv.version}`);
-            } catch (err) {
-                console.error(err.message);
-            }
-        }
+        describe: 'Switch to the specified version of Terraform',
+        handler: commandRunner(useCommand)
+    })
+    .command({
+        command: 'install <version>', 
+        describe: 'Install the specified version of Terraform',
+        handler: commandRunner(installCommand)
+    })
+    .command({
+        command: 'uninstall <version>', 
+        describe: 'Uninstall the specified version of Terraform',
+        handler: commandRunner(uninstallCommand)
     })
     .demandCommand()
     .help()
